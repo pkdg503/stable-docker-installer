@@ -263,7 +263,7 @@ get_batch_config() {
             http_port=$((http_port + 1))
         done
         
-        while ! check_port_available "$https_port" "$container_name" || [ "$https_port" -eq "$http_port" ]; then
+        while ! check_port_available "$https_port" "$container_name" || [ "$https_port" -eq "$http_port" ]; do
             echo -e "${YELLOW}⚠️  HTTPS 端口 ${https_port} 不可用，尝试 ${https_port}+1${NC}"
             https_port=$((https_port + 1))
         done
