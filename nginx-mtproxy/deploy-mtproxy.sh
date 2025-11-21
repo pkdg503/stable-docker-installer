@@ -187,6 +187,22 @@ get_server_ip() {
     echo "$ip"
 }
 
+# 生成随机secret（兼容没有xxd的系统）
+generate_secret() {
+    if command -v xxd &> /dev/null; then
+        # 如果有xxd命令，使用原来的方法
+        head -c 16 /dev/urandom | xxd -ps
+    else
+        # 如果没有xxd，使用openssl或其它方法
+        if command -v openssl &> /dev/null; then
+            openssl rand -hex 16
+        else
+            # 最后的方法，使用/dev/urandom和tr
+            head -c 16 /dev/urandom | od -An -tx1 | tr -d ' \n'
+        fi
+    fi
+}
+
 # 获取批量部署配置
 get_batch_config() {
     echo -e "\n${BLUE}📋 批量部署配置${NC}"
@@ -265,18 +281,6 @@ get_batch_config() {
         local domain_index=$((i % ${#domains_array[@]}))
         local domain="${domains_array[$domain_index]}"
         
-        # 检查端口是否可用
-        while ! check_port_available "$http_port" "$container_name"; do
-            echo -e "${YELLOW}⚠️  HTTP 端口 ${http_port} 不可用，尝试 ${http_port}+1${NC}"
-            http_port=$((http_port + 1))
-        done
-        
-        # 检查HTTPS端口是否可用
-        while ! check_port_available "$https_port" "$container_name" || [ "$https_port" -eq "$http_port" ]; do
-            echo -e "${YELLOW}⚠️  HTTPS 端口 ${https_port} 不可用，尝试 ${https_port}+1${NC}"
-            https_port=$((https_port + 1))
-        done
-        
         container_configs+=("$container_name:$http_port:$https_port:$domain")
     done
     
@@ -312,9 +316,10 @@ get_https_link() {
     echo "$https_link"
 }
 
-# 从单个容器日志中提取HTTPS链接信息
+# 从单个容器日志中提取HTTPS链接信息并修正端口
 extract_https_info_from_logs() {
     local container_name=$1
+    local actual_https_port=$2
     local max_attempts=3
     local attempt=1
     
@@ -322,16 +327,15 @@ extract_https_info_from_logs() {
         # 获取容器日志的最后20行
         local container_logs=$(docker logs "$container_name" 2>&1 | tail -20)
         
-        # 从日志中提取secret和链接信息
-        if echo "$container_logs" | grep -q "Secret:"; then
-            local secret=$(echo "$container_logs" | grep "Secret:" | awk '{print $2}' | head -1)
-            local link_info=$(echo "$container_logs" | grep -E "https?://" | head -1 | tr -d '[:space:]')
-            
-            if [ -n "$secret" ] && [ -n "$link_info" ]; then
-                echo -e "${GREEN}✅ 成功获取 ${container_name} 的配置信息${NC}"
-                echo "$link_info"
-                return 0
-            fi
+        # 从日志中提取TG链接信息
+        local tg_link=$(echo "$container_logs" | grep -E "https://t.me/proxy" | head -1 | tr -d '[:space:]')
+        
+        if [ -n "$tg_link" ]; then
+            # 修正端口为实际映射端口
+            local corrected_link=$(echo "$tg_link" | sed "s/port=[0-9]*/port=${actual_https_port}/")
+            echo -e "${GREEN}✅ 成功获取 ${container_name} 的TG链接${NC}"
+            echo "$corrected_link"
+            return 0
         fi
         
         # 如果没找到，等待后重试
@@ -341,7 +345,6 @@ extract_https_info_from_logs() {
         attempt=$((attempt + 1))
     done
     
-    echo -e "${YELLOW}⚠️  无法从 ${container_name} 的日志中获取HTTPS链接，使用生成的链接${NC}"
     return 1
 }
 
@@ -352,24 +355,35 @@ batch_get_https_links() {
     local total_containers=${#deployed_containers[@]}
     local current=1
     
+    # 询问是否显示详细日志信息
+    echo -e "${YELLOW}📝 是否显示详细的TG链接获取过程？(y/N，默认不显示): ${NC}"
+    read -p "" show_details
+    show_details=${show_details:-n}
+    
     for config in "${deployed_containers[@]}"; do
         IFS=':' read -r container_name http_port https_port secret domain <<< "$config"
         
-        echo -e "${YELLOW}⏳ 获取 ${container_name} 的链接信息 (${current}/${total_containers})...${NC}"
+        if [[ $show_details =~ ^[Yy]$ ]]; then
+            echo -e "${YELLOW}⏳ 获取 ${container_name} 的链接信息 (${current}/${total_containers})...${NC}"
+        fi
         
         # 生成基础HTTPS链接
         local base_https_link=$(get_https_link "$container_name" "$secret" "$https_port" "$domain")
         
-        # 尝试从日志中获取实际链接
-        local log_link_info=$(extract_https_info_from_logs "$container_name")
+        # 尝试从日志中获取实际TG链接并修正端口
+        local tg_link_info=$(extract_https_info_from_logs "$container_name" "$https_port")
         
         # 存储链接信息
-        if [ -n "$log_link_info" ] && [ "$log_link_info" != "null" ]; then
-            https_links_map["$container_name"]="$log_link_info"
-            echo -e "${GREEN}✅ 从日志获取: ${log_link_info}${NC}"
+        if [ -n "$tg_link_info" ]; then
+            https_links_map["$container_name"]="$tg_link_info"
+            if [[ $show_details =~ ^[Yy]$ ]]; then
+                echo -e "${GREEN}✅ 获取TG链接: ${tg_link_info}${NC}"
+            fi
         else
             https_links_map["$container_name"]="$base_https_link"
-            echo -e "${CYAN}📋 使用生成链接: ${base_https_link}${NC}"
+            if [[ $show_details =~ ^[Yy]$ ]]; then
+                echo -e "${CYAN}📋 使用生成链接: ${base_https_link}${NC}"
+            fi
         fi
         
         current=$((current + 1))
@@ -390,19 +404,40 @@ deploy_single_container() {
     
     # 检查容器是否已存在
     if ! check_existing_container "$container_name"; then
+        echo -e "${YELLOW}⏭️  跳过容器 ${container_name}${NC}"
         return 1
     fi
     
-    # 再次确认端口可用性
-    if ! check_port_available "$http_port" "$container_name"; then
-        return 1
-    fi
-    if ! check_port_available "$https_port" "$container_name"; then
-        return 1
+    # 动态检查端口可用性并自动调整
+    local original_http_port=$http_port
+    local original_https_port=$https_port
+    
+    # 检查HTTP端口是否可用
+    while ! check_port_available "$http_port" "$container_name"; do
+        echo -e "${YELLOW}⚠️  HTTP 端口 ${http_port} 不可用，尝试 ${http_port}+1${NC}"
+        http_port=$((http_port + 1))
+    done
+    
+    # 检查HTTPS端口是否可用
+    while ! check_port_available "$https_port" "$container_name" || [ "$https_port" -eq "$http_port" ]; do
+        echo -e "${YELLOW}⚠️  HTTPS 端口 ${https_port} 不可用，尝试 ${https_port}+1${NC}"
+        https_port=$((https_port + 1))
+    done
+    
+    # 如果端口有调整，更新配置
+    if [ "$http_port" -ne "$original_http_port" ] || [ "$https_port" -ne "$original_https_port" ]; then
+        echo -e "${YELLOW}🔄 端口已调整为: HTTP=${http_port}, HTTPS=${https_port}${NC}"
+        # 更新container_configs中的端口
+        for i in "${!container_configs[@]}"; do
+            if [[ "${container_configs[$i]}" == "$container_name:"* ]]; then
+                container_configs[$i]="$container_name:$http_port:$https_port:$domain"
+                break
+            fi
+        done
     fi
     
     # 生成随机 secret
-    secret=$(head -c 16 /dev/urandom | xxd -ps)
+    secret=$(generate_secret)
     
     echo -e "${GREEN}🔧 容器配置：${NC}"
     echo -e "  ${CYAN}🔑 Secret: ${secret}${NC}"
@@ -459,16 +494,16 @@ show_deployment_result() {
         
         # 显示部署详情表格
         echo -e "\n${YELLOW}📋 部署详情：${NC}"
-        printf "${CYAN}%-20s %-12s %-12s %-15s %-34s %s${NC}\n" "容器名称" "HTTP端口" "HTTPS端口" "伪装域名" "Secret" "HTTPS链接"
-        echo "${CYAN}────────────────────────────────────────────────────────────────────────────────────────────────────────────${NC}"
+        printf "${CYAN}%-20s %-12s %-12s %-20s %-34s %s${NC}\n" "容器名称" "HTTP端口" "HTTPS端口" "伪装域名" "Secret" "TG代理链接"
+        echo -e "${CYAN}─────────────────────────────────────────────────────────────────────────────────────────────────────────────────────${NC}"
         
         for config in "${deployed_containers[@]}"; do
             IFS=':' read -r name http_port https_port secret domain <<< "$config"
             
-            # 从关联数组中获取HTTPS链接
-            local https_link="${https_links_map[$name]}"
+            # 从关联数组中获取TG链接
+            local tg_link="${https_links_map[$name]}"
             
-            printf "%-20s %-12s %-12s %-15s %-34s %s\n" "$name" "$http_port" "$https_port" "$domain" "$secret" "$https_link"
+            printf "%-20s %-12s %-12s %-20s %-34s %s\n" "$name" "$http_port" "$https_port" "$domain" "$secret" "$tg_link"
         done
         
         # 显示管理命令
@@ -480,8 +515,8 @@ show_deployment_result() {
         echo -e "删除容器:      ${YELLOW}docker rm -f <容器名称>${NC}"
         
         echo -e "\n${YELLOW}💡 提示：${NC}"
-        echo -e "  • 请妥善保存上面的 Secret 和 HTTPS 链接信息"
-        echo -e "  • 可以使用 HTTPS 链接直接配置客户端"
+        echo -e "  • 请妥善保存上面的 Secret 和 TG 代理链接"
+        echo -e "  • 可以直接点击TG链接一键配置代理"
         echo -e "  • 确保服务器防火墙已开放相关端口"
         
     fi
